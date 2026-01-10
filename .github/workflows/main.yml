@@ -1,4 +1,4 @@
-name: RDP 
+name: RDP
 
 on:
   workflow_dispatch:
@@ -9,110 +9,82 @@ jobs:
     timeout-minutes: 3600
 
     steps:
-      - name: Configure RDP
-        shell: pwsh
+      - name: Configure Core RDP Settings
         run: |
-          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name fDenyTSConnections -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
 
-          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name UserAuthentication -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
 
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
 
-          Restart-Service TermService -Force
+          Restart-Service -Name TermService -Force
 
-      - name: Create RDP User
-        shell: pwsh
+      - name: Create RDP User (Fixed Credentials)
         run: |
-          $password = -join ((33..126) | Get-Random -Count 16 | ForEach-Object { [char]$_ })
-          $secure   = ConvertTo-SecureString $password -AsPlainText -Force
+          $username = "RDP"
+          $password = "12345qwert@"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          New-LocalUser -Name "RDP" -Password $secure -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+              Write-Host "User already exists, updating password..."
+              Set-LocalUser -Name $username -Password $securePass
+          } else {
+              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
+          }
 
-          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+
+          echo "RDP_USER=RDP" >> $env:GITHUB_ENV
+          echo "RDP_PASS=12345qwert@" >> $env:GITHUB_ENV
 
       - name: Install Tailscale
-        shell: pwsh
         run: |
-          $url  = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $path = "$env:TEMP\tailscale.msi"
 
-          Invoke-WebRequest -Uri $url -OutFile $path
+          Invoke-WebRequest $url -OutFile $path
           Start-Process msiexec.exe -ArgumentList "/i `"$path`" /quiet /norestart" -Wait
           Remove-Item $path -Force
 
-      - name: Connect Tailscale (20 Keys)
-        shell: pwsh
+      - name: Establish Tailscale Connection
         run: |
-          $keys = @(
-            "${{ secrets.TAILSCALE_AUTH_KEY }}",
-            "${{ secrets.TAILSCALE_AUTH_KEY2 }}",
-            "${{ secrets.TAILSCALE_AUTH_KEY3 }}",
-            "${{ secrets.TAILSCALE_AUTH_KEY4 }}",
-            "${{ secrets.TAILSCALE_AUTH_KEY5 }}",
-            "${{ secrets.TAILSCALE_AUTH_KEY6 }}",
-            "${{ secrets.TAILSCALE_AUTH_KEY7 }}",
-            "${{ secrets.TAILSCALE_AUTH_KEY8 }}",
-            "${{ secrets.TAILSCALE_AUTH_KEY9 }}",
-            "${{ secrets.TAILSCALE_AUTH_KEY10 }}",
-            "${{ secrets.TAILSCALE_AUTH_KEY11 }}",
-            "${{ secrets.TAILSCALE_AUTH_KEY12 }}",
-            "${{ secrets.TAILSCALE_AUTH_KEY13 }}",
-            "${{ secrets.TAILSCALE_AUTH_KEY14 }}",
-            "${{ secrets.TAILSCALE_AUTH_KEY15 }}",
-            "${{ secrets.TAILSCALE_AUTH_KEY16 }}",
-            "${{ secrets.TAILSCALE_AUTH_KEY17 }}",
-            "${{ secrets.TAILSCALE_AUTH_KEY18 }}",
-            "${{ secrets.TAILSCALE_AUTH_KEY19 }}",
-            "${{ secrets.TAILSCALE_AUTH_KEY20 }}"
-          )
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=gh-runner-$env:GITHUB_RUN_ID
 
-          $connected = $false
-          $i = 1
-
-          foreach ($key in $keys) {
-            if ([string]::IsNullOrWhiteSpace($key)) {
-              $i++
-              continue
-            }
-
-            Write-Host "Trying Tailscale key #$i"
-            & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
-              --authkey=$key `
-              --hostname=gh-$env:GITHUB_RUN_ID
-
-            Start-Sleep -Seconds 10
-
-            $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
-            if ($ip) {
-              echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
-              Write-Host "Connected with key #$i"
-              $connected = $true
-              break
-            }
-
-            $i++
+          $ip = $null
+          for ($i=0; $i -lt 10; $i++) {
+              $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              if ($ip) { break }
+              Start-Sleep 5
           }
 
-          if (-not $connected) {
-            Write-Error "All Tailscale keys failed"
-            exit 1
+          if (-not $ip) {
+              Write-Error "Failed to get Tailscale IP"
+              exit 1
           }
 
-      - name: Show RDP Info
-        shell: pwsh
+          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
         run: |
-          Write-Host ""
-          Write-Host "===== RDP ACCESS ====="
-          Write-Host "address:$env:TAILSCALE_IP"
-          Write-Host "username:RDP"
-          Write-Host "password:$env:RDP_PASSWORD"
-          Write-Host "======================"
-          Write-Host ""
+          Test-NetConnection $env:TAILSCALE_IP -Port 3389
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "=============================="
+          Write-Host "RDP READY"
+          Write-Host "IP       : $env:TAILSCALE_IP"
+          Write-Host "Username : RDP"
+          Write-Host "Password : 12345qwert@"
+          Write-Host "=============================="
 
           while ($true) {
             Start-Sleep 300
